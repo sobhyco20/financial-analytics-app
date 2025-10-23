@@ -13,6 +13,153 @@ OPTIONAL_COLS = {
     "purchase_vat", "sales_vat", "ar_days", "ap_days"
 }
 
+
+# ========= ميزان المراجعة: دوال مساعدة =========
+import re
+
+AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"]
+
+def detect_month_cols(columns):
+    """اكتشاف أعمدة الأشهر مثل 'يناير/2025' أو 'مارس 2025' أو 'Jan-2025'."""
+    month_cols = []
+    for c in columns:
+        c_str = str(c)
+        # عربي (يناير/2025 أو يناير 2025)
+        if any(m in c_str for m in AR_MONTHS):
+            month_cols.append(c)
+            continue
+        # نمط عام يحتوي على شهر/سنة
+        if re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}/\d{4}", c_str, re.IGNORECASE):
+            month_cols.append(c)
+    # الترتيب: حسب ظهور الشهر العربي إن أمكن
+    def month_key(c):
+        txt = str(c)
+        idx = None
+        for i,m in enumerate(AR_MONTHS):
+            if m in txt:
+                idx = i
+                break
+        return idx if idx is not None else 99
+    return sorted(month_cols, key=month_key)
+
+def tb_guess_cols(df):
+    """محاولة ذكية للتعرف على الأعمدة الشائعة في ميزان المراجعة."""
+    cols = {c:str(c).strip().lower() for c in df.columns}
+    inv = {v:k for k,v in cols.items()}
+    def find(*names):
+        for n in names:
+            if n in inv: return inv[n]
+        # ابحث جزئي بالعربي/إنجليزي
+        for k,v in cols.items():
+            if any(n in v for n in names):
+                return k
+        return None
+    return {
+        "acc_code": find("account_code","ledger account","account","رقم الحساب","كود"),
+        "acc_name": find("account_name","name","اسم الحساب","البيان"),
+        "opening":  find("opening","رصيد افتتاحي","الرصيد الافتتاحي"),
+        "is_col":   find("قائمة الدخل","income","statement_type"),   # عمود يدل أن الحساب يتبع قائمة الدخل (اختياري)
+        "bs_col":   find("المركز المالي","balance","financial position"),  # عمود يدل أن الحساب يتبع المركز المالي (اختياري)
+        "op_exp":   find("التشغيلية","operating"),
+        "sell_exp": find("البيعية","selling"),
+        "adm_exp":  find("الادارية","الإدارية","administrative"),
+    }
+
+def tb_period_sum(df, month_cols, until_col):
+    """جمع حركة الفترة من بداية السنة حتى شهر محدد."""
+    if not month_cols:
+        return pd.Series([0]*len(df))
+    upto = month_cols[:month_cols.index(until_col)+1] if until_col in month_cols else month_cols
+    return df[upto].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+
+def classify_bs(name_or_label):
+    txt = str(name_or_label).strip().lower()
+    # كلمات مفتاحية عربية/إنجليزية
+    if any(k in txt for k in ["أصول","اصل","asset","inventory","cash","bank","ذمم مدينة","مدينون","مخزون","ثابت"]):
+        return "ASSETS"
+    if any(k in txt for k in ["خصوم","التزامات","payable","قروض","موردين","ذمم دائنة"]):
+        return "LIABILITIES"
+    if any(k in txt for k in ["حقوق ملكية","equity","رأس المال","رأس المال","احتياطي","مخصص"]):
+        return "EQUITY"
+    return None
+
+def classify_is(name_or_label):
+    txt = str(name_or_label).strip().lower()
+    if any(k in txt for k in ["مبيعات","ايراد","إيراد","revenue","sales"]):
+        return "REVENUE"
+    if any(k in txt for k in ["تكلفة","cogs","cost of","تكاليف المبيعات"]):
+        return "COGS"
+    if any(k in txt for k in ["مصروف","expense","رواتب","ايجار","إيجار","تشغيلية","بيعية","إدارية","ادارية"]):
+        return "EXPENSE"
+    return None
+
+def build_financials_from_tb(df, period_amount, guesses):
+    """
+    df: إطار ميزان المراجعة الأصلي (أو بعد تحديد الأعمدة)
+    period_amount: سلسلة تمثل مجموع الحركة YTD لكل حساب
+    guesses: تخمينات الأعمدة من tb_guess_cols
+    """
+    # أعمدة الأسماء
+    name_col = guesses["acc_name"] or df.columns[0]
+    # محاولة استخراج أعمدة التصنيف إن كانت موجودة
+    is_col = guesses["is_col"]
+    bs_col = guesses["bs_col"]
+
+    out = pd.DataFrame({
+        "account": df.get(guesses["acc_code"], pd.Series([None]*len(df))),
+        "name": df[name_col],
+        "opening": pd.to_numeric(df.get(guesses["opening"], 0), errors="coerce").fillna(0),
+        "ytd": pd.to_numeric(period_amount, errors="coerce").fillna(0),
+    })
+    out["closing"] = out["opening"] + out["ytd"]
+
+    # ===== قائمة الدخل =====
+    # مصادر: عمود "قائمة الدخل" إن وجد، أو بالاستدلال على الاسم/أعمدة التشغيل/البيع/الإدارة
+    is_flag = df[is_col] if is_col in df.columns else None
+    out["is_class"] = None
+    if is_flag is not None:
+        out.loc[:, "is_class"] = df[is_col].apply(classify_is)
+    else:
+        out.loc[:, "is_class"] = df[name_col].apply(classify_is)
+
+    # تقوية التصنيف بالمصروفات التفصيلية إن وجدت
+    for sub_col, label in [(guesses["op_exp"],"EXPENSE"), (guesses["sell_exp"],"EXPENSE"), (guesses["adm_exp"],"EXPENSE")]:
+        if sub_col in df.columns:
+            out.loc[df[sub_col].fillna(0)!=0, "is_class"] = "EXPENSE"
+
+    revenue = out.loc[out["is_class"]=="REVENUE","ytd"].sum()
+    cogs    = out.loc[out["is_class"]=="COGS","ytd"].sum()
+    opex    = out.loc[out["is_class"]=="EXPENSE","ytd"].sum()
+    gross_profit = revenue - cogs
+    net_profit   = gross_profit - opex
+
+    is_table = pd.DataFrame({
+        "البند": ["الإيرادات","تكلفة المبيعات","الربح الإجمالي","مصروفات التشغيل/البيع/الإدارة","صافي الربح"],
+        "القيمة": [revenue, -cogs, gross_profit, -opex, net_profit]
+    })
+
+    # ===== المركز المالي =====
+    bs_flag = df[bs_col] if bs_col in df.columns else None
+    out["bs_class"] = None
+    if bs_flag is not None:
+        out.loc[:, "bs_class"] = df[bs_col].apply(classify_bs)
+    else:
+        out.loc[:, "bs_class"] = df[name_col].apply(classify_bs)
+
+    assets = out.loc[out["bs_class"]=="ASSETS","closing"].sum()
+    liab   = out.loc[out["bs_class"]=="LIABILITIES","closing"].sum()
+    equity = out.loc[out["bs_class"]=="EQUITY","closing"].sum()
+
+    bs_table = pd.DataFrame({
+        "البند": ["الأصول","الخصوم","حقوق الملكية","الخصوم + حقوق الملكية - الأصول"],
+        "القيمة": [assets, liab, equity, (liab + equity - assets)]
+    })
+
+    return out, is_table, bs_table, net_profit
+
+
+
+
 # --------- وظائف مساعدة ---------
 @st.cache_data
 def read_file(file) -> pd.DataFrame:
