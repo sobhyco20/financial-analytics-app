@@ -444,3 +444,80 @@ else:
 
     with tab_export:
         export_results(df)
+
+    with tab_tb:
+        st.subheader("📚 ميزان المراجعة → استخراج القوائم المالية")
+    
+        tb_file = st.file_uploader("ارفع ملف ميزان المراجعة (Excel)", type=["xlsx","xls"], key="tb_upl")
+        if tb_file:
+            try:
+                tb_df = pd.read_excel(tb_file)
+                st.success("تم تحميل ميزان المراجعة.")
+                st.dataframe(tb_df.head(20), use_container_width=True)
+    
+                # اكتشاف أعمدة الشهور
+                month_cols = detect_month_cols(tb_df.columns)
+                guesses = tb_guess_cols(tb_df)
+    
+                st.markdown("### ضبط الأعمدة (يمكن تعديل الاختيارات):")
+                c1, c2, c3 = st.columns(3)
+                acc_name_col = c1.selectbox("عمود اسم الحساب", options=list(tb_df.columns), index=(list(tb_df.columns).index(guesses["acc_name"]) if guesses["acc_name"] in tb_df.columns else 0))
+                opening_col  = c2.selectbox("عمود الرصيد الافتتاحي", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["opening"]) if guesses["opening"] in tb_df.columns else 0)
+                is_col       = c3.selectbox("عمود دلالة (قائمة الدخل) إن وجد", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["is_col"]) if guesses["is_col"] in tb_df.columns else 0)
+    
+                c4, c5, c6 = st.columns(3)
+                bs_col      = c4.selectbox("عمود دلالة (المركز المالي) إن وجد", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["bs_col"]) if guesses["bs_col"] in tb_df.columns else 0)
+                op_exp_col  = c5.selectbox("عمود مصروفات تشغيلية إن وجد", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["op_exp"]) if guesses["op_exp"] in tb_df.columns else 0)
+                sell_exp_col= c6.selectbox("عمود مصروفات بيعية إن وجد", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["sell_exp"]) if guesses["sell_exp"] in tb_df.columns else 0)
+    
+                c7, c8 = st.columns(2)
+                adm_exp_col = c7.selectbox("عمود مصروفات إدارية إن وجد", options=[None]+list(tb_df.columns), index=([None]+list(tb_df.columns)).index(guesses["adm_exp"]) if guesses["adm_exp"] in tb_df.columns else 0)
+    
+                # اختيار شهر نهاية الفترة (YTD)
+                if month_cols:
+                    until_month = st.selectbox("اجمع من بداية السنة حتى:", options=month_cols, index=len(month_cols)-1)
+                    ytd = tb_period_sum(tb_df, month_cols, until_month)
+                else:
+                    st.info("لم يتم العثور على أعمدة أشهر. سيتم استخدام حركة صفرية ما لم تكن هناك أعمدة حركة أخرى.")
+                    ytd = pd.Series([0]*len(tb_df))
+    
+                # غيّر التخمينات حسب المستخدم
+                if acc_name_col: guesses["acc_name"] = acc_name_col
+                if opening_col:  guesses["opening"]  = opening_col
+                if is_col:       guesses["is_col"]   = is_col
+                if bs_col:       guesses["bs_col"]   = bs_col
+                if op_exp_col:   guesses["op_exp"]   = op_exp_col
+                if sell_exp_col: guesses["sell_exp"] = sell_exp_col
+                if adm_exp_col:  guesses["adm_exp"]  = adm_exp_col
+    
+                # بناء القوائم
+                detail_df, is_table, bs_table, net_profit = build_financials_from_tb(tb_df, ytd, guesses)
+    
+                st.markdown("### 📌 قائمة الدخل (YTD)")
+                st.dataframe(is_table, use_container_width=True)
+    
+                st.markdown("### 🧾 المركز المالي (بنهاية الفترة)")
+                st.dataframe(bs_table, use_container_width=True)
+    
+                colA, colB, colC = st.columns(3)
+                colA.metric("الإيرادات", f"{float(is_table.loc[is_table['البند']=='الإيرادات','القيمة'].values[0]):,.0f}")
+                colB.metric("مصروفات التشغيل/البيع/الإدارة", f"{float(is_table.loc[is_table['البند']=='مصروفات التشغيل/البيع/الإدارة','القيمة'].values[0]):,.0f}")
+                colC.metric("صافي الربح", f"{float(is_table.loc[is_table['البند']=='صافي الربح','القيمة'].values[0]):,.0f}")
+    
+                st.markdown("### 🔍 تفصيل الحسابات (بعد التحويل)")
+                st.dataframe(detail_df[["account","name","opening","ytd","closing","is_class","bs_class"]].head(200), use_container_width=True)
+    
+                # تنزيل النتائج
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+                    tb_df.to_excel(xw, index=False, sheet_name="TrialBalanceRaw")
+                    detail_df.to_excel(xw, index=False, sheet_name="Detail")
+                    is_table.to_excel(xw, index=False, sheet_name="IncomeStatement")
+                    bs_table.to_excel(xw, index=False, sheet_name="BalanceSheet")
+                st.download_button("⬇️ تنزيل القوائم كملف Excel", buf.getvalue(), file_name="financials_from_trial_balance.xlsx")
+    
+            except Exception as e:
+                st.error(f"تعذر معالجة الملف: {e}")
+        else:
+            st.info("ارفع ملف ميزان المراجعة بصيغة Excel للبدء.")
+
