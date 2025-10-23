@@ -87,7 +87,8 @@ def dim_analysis(df: pd.DataFrame, dim: str, top_n: int = 10):
 
 def cashflow_and_aging(df: pd.DataFrame):
     st.subheader("💵 التدفقات والأعمار")
-    # تدفق نقدي مبسط: صافي تحصيل (افتراضيًا revenue - expenses)
+
+    # تدفق نقدي مبسّط: صافي تحصيل = revenue - expenses
     cf = df[["date","revenue","expenses"]].dropna(subset=["date"]).copy()
     cf["cash_flow"] = cf["revenue"] - cf["expenses"]
     by_m = cf.groupby(cf["date"].dt.to_period("M")).agg({"cash_flow":"sum"}).reset_index()
@@ -97,25 +98,46 @@ def cashflow_and_aging(df: pd.DataFrame):
     st.write("**التدفق الشهري:**")
     st.dataframe(by_m[["period","cash_flow"]], use_container_width=True)
 
-    # أعمار الذمم (لو عندنا ar_days/ap_days تمثل أعمار فواتير)
+    # أعمار الذمم المدينة (AR)
     if "ar_days" in df.columns:
         st.markdown("**أعمار الذمم المدينة (AR)**")
-        ar_bins = pd.cut(pd.to_numeric(df["ar_days"], errors="coerce"),
-                         bins=[-1,30,60,90,180,365,1_000_000],
-                         labels=["0-30","31-60","61-90","91-180","181-365",">365"])
-        ar_pivot = df.groupby(ar_bins)["revenue"].sum().reset_index().rename(columns={"ar_days":"bucket","revenue":"amount"})
-        fig_ar = px.pie(ar_pivot, names="ar_days", values="amount")
-        st.plotly_chart(fig_ar, use_container_width=True)
-        st.dataframe(ar_pivot, use_container_width=True)
+        ar_vals = pd.to_numeric(df["ar_days"], errors="coerce")
+        ar_bins = [-1,30,60,90,180,365,1_000_000]
+        ar_labels = ["0-30","31-60","61-90","91-180","181-365",">365"]
+        ar_bucket = pd.cut(ar_vals, bins=ar_bins, labels=ar_labels, include_lowest=True)
+        ar_pivot = (
+            df.assign(ar_bucket=ar_bucket)
+              .groupby("ar_bucket", dropna=True)["revenue"]
+              .sum()
+              .reset_index(name="amount")
+        )
+        if len(ar_pivot):
+            fig_ar = px.pie(ar_pivot, names="ar_bucket", values="amount")
+            st.plotly_chart(fig_ar, use_container_width=True)
+            st.dataframe(ar_pivot, use_container_width=True)
+        else:
+            st.info("لا توجد بيانات صالحة لأعمار الذمم المدينة.")
+
+    # أعمار الذمم الدائنة (AP)
     if "ap_days" in df.columns:
         st.markdown("**أعمار الذمم الدائنة (AP)**")
-        ap_bins = pd.cut(pd.to_numeric(df["ap_days"], errors="coerce"),
-                         bins=[-1,30,60,90,180,365,1_000_000],
-                         labels=["0-30","31-60","61-90","91-180","181-365",">365"])
-        ap_pivot = df.groupby(ap_bins)["expenses"].sum().reset_index().rename(columns={"ap_days":"bucket","expenses":"amount"})
-        fig_ap = px.pie(ap_pivot, names="ap_days", values="amount")
-        st.plotly_chart(fig_ap, use_container_width=True)
-        st.dataframe(ap_pivot, use_container_width=True)
+        ap_vals = pd.to_numeric(df["ap_days"], errors="coerce")
+        ap_bins = [-1,30,60,90,180,365,1_000_000]
+        ap_labels = ["0-30","31-60","61-90","91-180","181-365",">365"]
+        ap_bucket = pd.cut(ap_vals, bins=ap_bins, labels=ap_labels, include_lowest=True)
+        ap_pivot = (
+            df.assign(ap_bucket=ap_bucket)
+              .groupby("ap_bucket", dropna=True)["expenses"]
+              .sum()
+              .reset_index(name="amount")
+        )
+        if len(ap_pivot):
+            fig_ap = px.pie(ap_pivot, names="ap_bucket", values="amount")
+            st.plotly_chart(fig_ap, use_container_width=True)
+            st.dataframe(ap_pivot, use_container_width=True)
+        else:
+            st.info("لا توجد بيانات صالحة لأعمار الذمم الدائنة.")
+
 
 def forecast_simple(df: pd.DataFrame):
     st.subheader("🔮 توقّعات مبسطة")
